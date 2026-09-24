@@ -1,0 +1,1006 @@
+# SecureAgent — Implementation Plan (Revised v2)
+
+> **Status**: Awaiting Approval
+> **Target Directory**: `D:\MEETmux\secureagent\`
+> **Revision**: All 22 changes from user review incorporated.
+
+---
+
+## 1. High-Level Architecture
+
+### BFF Pattern (Change #1, #2)
+
+The browser **never** talks directly to FastAPI. All requests — including the SSE stream — flow through Next.js Route Handlers. Each Route Handler mints a short-lived (5–15 min) **HS256 JWT** server-side using the shared `BACKEND_SECRET` and forwards it to FastAPI in an `Authorization: Bearer` header.
+
+```
+Browser
+  │
+  │  (session cookie, HTTP-only)
+  ▼
+Next.js App (port 3000)
+  ├── /app pages            ← Server + Client Components
+  ├── /app/api/*            ← Route Handlers (BFF proxy)
+  │     ├── mint HS256 JWT  ← BACKEND_SECRET (server-side only)
+  │     ├── proxy → FastAPI ← BACKEND_URL (server-side only)
+  │     └── /api/scans/[id]/stream  ← proxies SSE, or uses
+  │                                    @microsoft/fetch-event-source
+  └── /app/api/auth/[...nextauth]  ← NextAuth GitHub OAuth
+           │
+           └── stores GitHub token in server-side session
+                 (never exposed to browser)
+                            │
+                            ▼
+                       FastAPI (port 8000)
+                            │
+                    ┌───────┴────────┐
+                    │                │
+              PostgreSQL         Redis
+              (SQLite MVP)    (BackgroundTasks MVP)
+                                     │
+                                     ▼
+                              LangGraph Agent
+                         ┌─────────────────────┐
+                         │ Ingest → Scan        │
+                         │  ↓                   │
+                         │ Triage               │
+                         │  ↓                   │
+                         │ [per-finding loop]   │
+                         │  Fix → Verify → ···  │
+                         │  ↓                   │
+                         │ Report               │
+                         └─────────────────────┘
+                                     │
+                              Docker Sandbox
+                         (install stage + scan/test stage)
+```
+
+### SSE Streaming (Change #2)
+
+The native browser `EventSource` API cannot send custom headers, so the SSE stream is proxied through a Next.js Route Handler using `@microsoft/fetch-event-source`. The Route Handler maintains the connection to FastAPI and re-streams events to the browser. `Last-Event-ID` is forwarded so replay works transparently.
+
+### Docker Architecture & Socket Decision (Change #15)
+
+**The Docker socket is NOT mounted into any container that handles untrusted input.** Instead, the FastAPI backend process (running on the host or in its own container) calls the Docker SDK directly to spawn sandbox containers. This means:
+
+- FastAPI container itself never touches the Docker socket (or it has the socket but is trusted and never processes untrusted code directly).
+- Sandbox containers receive only a copy of the workspace directory via a bind mount scoped to that scan's temp directory.
+- **Risk acknowledged**: if the FastAPI host is compromised, an attacker could spawn arbitrary containers. Mitigations: run FastAPI as a non-root user, use AppArmor/seccomp on the sandbox image, and keep the Docker socket accessible only to the trusted FastAPI service account.
+
+---
+
+## 2. Auth Design
+
+### Choice: **GitHub OAuth App** (MVP) → **GitHub App** (Phase 4+)
+
+| Factor | OAuth App | GitHub App |
+|---|---|---|
+| Scopes | `repo`, `read:user` | Fine-grained per-repo |
+| PR creation | ✅ | ✅ (preferred) |
+| Bot identity | User's name | `secureagent[bot]` |
+| Installation flow | Simple redirect | Requires installation |
+| Security | Broad scopes | Minimal required scopes |
+
+**MVP** uses OAuth App. **Phase 4** upgrades to a GitHub App (fine-grained `contents:write` + `pull_requests:write`).
+
+### JWT Flow (Change #1)
+
+```
+1. User logs in via NextAuth (GitHub OAuth)
+2. NextAuth stores GitHub access_token in server-side session (encrypted, never sent to browser)
+3. Browser makes request to /api/* Next.js Route Handler
+4. Route Handler reads server-side session → retrieves user_id + github_login
+5. Route Handler mints HS256 JWT: { sub: user_id, iat, exp: now+10min } signed with BACKEND_SECRET
+6. Route Handler proxies request to FastAPI with Authorization: Bearer <jwt>
+7. FastAPI validates JWT (same BACKEND_SECRET), extracts user_id, proceeds
+8. JWT is NEVER stored in browser (not in localStorage, not in cookies)
+```
+
+---
+
+## 3. Monorepo Folder Structure
+
+```
+D:\MEETmux\secureagent\
+├── frontend/                              # Next.js 14 App Router
+│   ├── app/
+│   │   ├── (auth)/
+│   │   │   └── login/page.tsx
+│   │   ├── (dashboard)/
+│   │   │   ├── layout.tsx
+│   │   │   ├── dashboard/page.tsx
+│   │   │   ├── repos/
+│   │   │   │   ├── page.tsx
+│   │   │   │   └── [id]/
+│   │   │   │       ├── page.tsx
+│   │   │   │       ├── findings/page.tsx
+│   │   │   │       ├── diffs/page.tsx
+│   │   │   │       └── prs/page.tsx
+│   │   │   ├── reports/page.tsx
+│   │   │   └── settings/page.tsx
+│   │   ├── api/                           # BFF Route Handlers (proxy to FastAPI)
+│   │   │   ├── auth/[...nextauth]/route.ts
+│   │   │   ├── github/
+│   │   │   │   └── repos/route.ts         # GET /github/repos
+│   │   │   ├── repos/
+│   │   │   │   ├── route.ts               # GET, POST
+│   │   │   │   └── [id]/route.ts          # GET, DELETE
+│   │   │   ├── scans/
+│   │   │   │   ├── route.ts               # POST
+│   │   │   │   └── [id]/
+│   │   │   │       ├── route.ts           # GET
+│   │   │   │       ├── stream/route.ts    # SSE proxy
+│   │   │   │       ├── cancel/route.ts    # POST /scans/{id}/cancel
+│   │   │   │       └── findings/route.ts
+│   │   │   ├── findings/
+│   │   │   │   └── [id]/route.ts
+│   │   │   ├── fixes/
+│   │   │   │   └── [id]/
+│   │   │   │       ├── approve/route.ts
+│   │   │   │       └── reject/route.ts
+│   │   │   ├── prs/
+│   │   │   │   ├── route.ts               # POST /prs
+│   │   │   │   └── [id]/
+│   │   │   │       └── refresh/route.ts   # POST /prs/{id}/refresh
+│   │   │   ├── dashboard/
+│   │   │   │   └── summary/route.ts       # GET /dashboard/summary
+│   │   │   ├── reports/
+│   │   │   │   └── [scanId]/route.ts
+│   │   │   └── settings/route.ts
+│   │   ├── layout.tsx
+│   │   └── page.tsx                       # Landing
+│   ├── components/
+│   │   ├── ui/                            # shadcn/ui generated
+│   │   ├── layout/
+│   │   │   ├── Sidebar.tsx
+│   │   │   ├── TopBar.tsx
+│   │   │   └── ThemeProvider.tsx
+│   │   ├── dashboard/
+│   │   │   ├── SecurityScoreCard.tsx
+│   │   │   ├── ScanHistoryChart.tsx
+│   │   │   └── RecentFindings.tsx
+│   │   ├── repo/
+│   │   │   ├── ConnectRepoModal.tsx
+│   │   │   ├── ScanProgress.tsx           # SSE stepper
+│   │   │   └── ScanLogStream.tsx
+│   │   ├── findings/
+│   │   │   ├── FindingsTable.tsx
+│   │   │   ├── FindingDrawer.tsx
+│   │   │   └── SeverityBadge.tsx
+│   │   ├── diff/
+│   │   │   └── DiffViewer.tsx
+│   │   └── shared/
+│   │       ├── LoadingSkeleton.tsx
+│   │       ├── EmptyState.tsx
+│   │       └── ToastNotifications.tsx
+│   ├── lib/
+│   │   ├── api.ts                         # Typed fetch wrappers (calls /api/*)
+│   │   ├── auth.ts                        # NextAuth config
+│   │   ├── bff.ts                         # Server-side JWT minting utility
+│   │   └── validations.ts                 # Zod schemas
+│   ├── hooks/
+│   │   ├── useScans.ts
+│   │   ├── useFindings.ts
+│   │   └── useScanStream.ts               # fetch-event-source hook
+│   ├── types/index.ts
+│   ├── tailwind.config.ts
+│   ├── next.config.ts
+│   └── package.json
+│
+├── backend/                               # FastAPI
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── config.py                      # pydantic-settings
+│   │   ├── database.py
+│   │   ├── models/
+│   │   │   ├── user.py
+│   │   │   ├── user_settings.py           # NEW
+│   │   │   ├── repository.py
+│   │   │   ├── scan.py
+│   │   │   ├── finding.py
+│   │   │   ├── fix.py
+│   │   │   ├── pull_request.py
+│   │   │   ├── pr_fixes.py                # NEW join table
+│   │   │   └── agent_log.py
+│   │   ├── schemas/
+│   │   │   ├── user.py
+│   │   │   ├── repository.py
+│   │   │   ├── scan.py
+│   │   │   ├── finding.py
+│   │   │   ├── fix.py
+│   │   │   └── pull_request.py
+│   │   ├── routers/
+│   │   │   ├── auth.py
+│   │   │   ├── github.py                  # GET /github/repos
+│   │   │   ├── repos.py
+│   │   │   ├── scans.py                   # incl. cancel + stream
+│   │   │   ├── findings.py
+│   │   │   ├── fixes.py
+│   │   │   ├── prs.py                     # POST /prs, POST /prs/{id}/refresh
+│   │   │   ├── dashboard.py               # GET /dashboard/summary
+│   │   │   ├── reports.py
+│   │   │   └── settings.py
+│   │   ├── services/
+│   │   │   ├── github.py
+│   │   │   ├── scan_runner.py
+│   │   │   ├── sse_broker.py              # tails agent_logs, supports Last-Event-ID
+│   │   │   ├── report_generator.py
+│   │   │   └── cleanup.py                 # TTL workspace cleanup job
+│   │   ├── middleware/
+│   │   │   ├── auth.py                    # HS256 JWT validation + IDOR helpers
+│   │   │   └── rate_limit.py              # keyed by user_id (Change #20)
+│   │   ├── tasks/
+│   │   │   └── scan_task.py               # BackgroundTask wrapper → Celery in P6
+│   │   └── startup.py                     # mark stale scans as failed on boot
+│   ├── alembic/versions/
+│   ├── tests/
+│   │   ├── test_auth.py
+│   │   ├── test_repos.py
+│   │   ├── test_scans.py
+│   │   └── test_idor.py                   # ownership enforcement tests
+│   ├── alembic.ini
+│   └── requirements.txt
+│
+├── agent/                                 # LangGraph agent
+│   ├── graph.py
+│   ├── state.py                           # AgentState TypedDict
+│   ├── nodes/
+│   │   ├── ingest.py
+│   │   ├── scan.py
+│   │   ├── triage.py
+│   │   ├── fix.py
+│   │   ├── verify.py
+│   │   └── report.py
+│   ├── scanners/
+│   │   ├── base.py
+│   │   ├── semgrep_scanner.py
+│   │   ├── bandit_scanner.py              # P2
+│   │   ├── trivy_scanner.py               # P2
+│   │   ├── gitleaks_scanner.py            # P2
+│   │   └── audit_scanner.py               # P2
+│   ├── llm/
+│   │   ├── client.py                      # Gemini API wrapper, two model slots
+│   │   ├── prompts/
+│   │   │   ├── triage.txt
+│   │   │   └── fix.txt
+│   │   └── sanitizer.py                   # nonce delimiters + injection signal filter
+│   ├── sandbox/
+│   │   └── docker_runner.py               # two-stage sandbox orchestrator
+│   ├── patch_builder.py                   # JSON → unified diff via difflib/git
+│   ├── patch_validator.py                 # guardrails (Change #12)
+│   ├── normalizer.py
+│   └── tests/
+│       ├── test_ingest.py
+│       ├── test_triage.py
+│       ├── test_fix.py
+│       ├── test_verify.py
+│       └── test_patch_validator.py
+│
+├── docker/
+│   ├── frontend.Dockerfile
+│   ├── backend.Dockerfile
+│   ├── agent.Dockerfile
+│   └── sandbox/
+│       ├── Dockerfile                     # hardened sandbox image (Phase 2)
+│       └── rules/                         # bundled Semgrep rules (offline)
+│
+├── demo-vulnerable-repo/                  # Moved to Phase 2
+│   ├── app.py                             # SQLi, hardcoded secret
+│   ├── templates/index.html               # XSS
+│   ├── requirements.txt                   # outdated deps
+│   └── README.md
+│
+├── scripts/
+│   ├── seed.py                            # demo data
+│   └── cleanup_workspaces.py             # TTL job
+│
+├── docker-compose.yml
+├── docker-compose.dev.yml
+├── .env.example
+└── README.md
+```
+
+---
+
+## 4. Database Schema
+
+### 4.1 Entity Overview
+
+```
+┌──────────────┐         ┌──────────────────┐        ┌───────────────────────┐
+│    users     │1       *│   repositories   │1      *│        scans          │
+│──────────────│         │──────────────────│        │───────────────────────│
+│ id (PK)      │────────▶│ id (PK)          │───────▶│ id (PK)               │
+│ github_id    │         │ user_id (FK)     │        │ repo_id (FK)          │
+│ login        │         │ github_repo_id   │        │ status (enum)         │
+│ email        │         │ full_name        │        │ started_at            │
+│ avatar_url   │         │ clone_url        │        │ completed_at          │
+│access_token_ │(encrypted)│ default_branch│        │ commit_sha            │ ← NEW
+│  encrypted   │         │ language         │        │ tokens_used           │ ← NEW
+│ created_at   │         │ is_active        │        │ security_score        │
+│ updated_at   │         │ last_scanned_at  │        │ total_findings        │
+└──────────────┘         └──────────────────┘        │ scanner_versions(JSON)│
+      │                                               │ error_message         │
+      │ 1                                             └───────────────────────┘
+      ▼ 1                                                        │
+┌──────────────────┐                                             │
+│  user_settings   │              ┌──────────────────────────────┘
+│──────────────────│              ▼
+│ id (PK)          │   ┌───────────────────────┐        ┌──────────────────────┐
+│ user_id (FK, UQ) │   │       findings        │1      *│        fixes         │
+│ auto_open_pr     │   │───────────────────────│        │──────────────────────│
+│ severity_threshld│   │ id (PK)               │───────▶│ id (PK)              │
+│ enabled_scanners │   │ scan_id (FK)          │        │ finding_id (FK)      │
+│ auto_fix_sevrs   │   │ rule_id               │        │ patch_diff           │
+│ max_findings_fix │   │ fingerprint           │ ← NEW  │ replacement_json     │
+│ llm_triage_model │   │ title                 │        │ explanation          │
+│ llm_fix_model    │   │ description           │        │ attempt_number       │
+│ max_patch_lines  │   │ severity (enum)       │        │ status (enum)        │
+└──────────────────┘   │ confidence            │        │ verified             │
+                       │ file_path             │        │ verify_output        │
+                       │ line_start            │        │ model_used           │ ← NEW
+                       │ line_end              │        │ files_changed (JSON) │ ← NEW
+                       │ code_snippet          │        │ approved_by          │
+                       │ explanation (LLM)     │        │ approved_at          │
+                       │ cwe_ids (JSON)        │        └──────────────────────┘
+                       │ owasp_tags (JSON)     │
+                       │ scanner               │        ┌──────────────────────┐
+                       │ status (enum)         │        │   pull_requests      │
+                       │ false_positive        │        │──────────────────────│
+                       │ is_masked             │        │ id (PK)              │
+                       └───────────────────────┘        │ scan_id (FK)         │
+                                                        │ github_pr_number     │
+                       ┌──────────────────────┐         │ github_pr_url        │
+                       │     agent_logs       │         │ branch_name          │
+                       │──────────────────────│         │ title                │
+                       │ id (PK)              │         │ status (enum)        │
+                       │ scan_id (FK)         │         │ created_at           │
+                       │ event_id (monotonic) │ ← NEW   │ merged_at            │
+                       │ node_name            │         │ has_secret_removal   │ ← NEW
+                       │ level                │         └──────────────────────┘
+                       │ message              │
+                       │ timestamp            │         ┌──────────────────────┐
+                       │ metadata (JSON)      │         │     pr_fixes         │ ← NEW
+                       └──────────────────────┘         │──────────────────────│
+                                                        │ pr_id (FK)           │
+                                                        │ fix_id (FK)          │
+                                                        │ PRIMARY KEY (pr,fix) │
+                                                        └──────────────────────┘
+```
+
+### 4.2 Key Enums
+
+| Enum | Values |
+|---|---|
+| `ScanStatus` | `pending` `cloning` `scanning` `triaging` `fixing` `verifying` `creating_pr` `completed` `failed` **`cancelled`** |
+| `FindingStatus` | `open` `fixed` `needs_review` `false_positive` `dismissed` |
+| `FixStatus` | `pending` `applied` `verified` `failed` `approved` `rejected` |
+| `Severity` | `critical` `high` `medium` `low` `info` |
+| `PRStatus` | `open` `merged` `closed` `draft` |
+
+### 4.3 Finding Fingerprint (Change #6)
+
+```python
+fingerprint = sha256(
+    f"{rule_id}:{file_path}:{normalize_whitespace(code_snippet)}"
+).hexdigest()
+```
+
+Used to track `new` / `existing` / `fixed` status across consecutive scans of the same repo without re-running full deduplication.
+
+### 4.4 Security Score Formula (Change #21)
+
+```
+score = max(0,
+  100
+  - (critical_count × 10)
+  - (high_count    × 5)
+  - (medium_count  × 2)
+  - (low_count     × 0.5)
+)
+```
+
+Computed at scan completion and stored in `scans.security_score`.
+
+---
+
+## 5. API Endpoints (FastAPI)
+
+> All endpoints enforce **ownership** (resource → repo → user_id) to prevent IDOR (Change #3).
+> Rate limiter is keyed by `user_id`, not IP (Change #20).
+
+### Auth
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/auth/validate` | Validate HS256 JWT from BFF, upsert user |
+| `GET` | `/api/v1/auth/me` | Current user info |
+
+### GitHub (Change #5)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/github/repos` | List user's GitHub repos for picker (was `/repos/{id}/github-repos`) |
+
+### Repositories
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/repos` | List connected repos |
+| `POST` | `/api/v1/repos` | Connect repo — **verifies push permission with GitHub** (Change #4) |
+| `DELETE` | `/api/v1/repos/{id}` | Disconnect repo |
+| `GET` | `/api/v1/repos/{id}` | Repo detail + last scan summary |
+| `GET` | `/api/v1/repos/{id}/scans` | Scan history |
+
+### Scans
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/scans` | Trigger scan `{repo_id, options}` |
+| `GET` | `/api/v1/scans/{id}` | Scan status + summary |
+| `GET` | `/api/v1/scans/{id}/stream` | **SSE** — live agent progress (supports `Last-Event-ID`) |
+| `POST` | `/api/v1/scans/{id}/cancel` | Cancel a running scan (Change #5) |
+
+### Findings
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/scans/{id}/findings` | List findings (filter: severity, status, scanner) |
+| `GET` | `/api/v1/findings/{id}` | Finding detail |
+| `PATCH` | `/api/v1/findings/{id}` | Update status (dismiss / mark FP) |
+
+### Fixes
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/findings/{id}/fixes` | List fix attempts |
+| `POST` | `/api/v1/fixes/{id}/approve` | Human approves fix → status = `approved` |
+| `POST` | `/api/v1/fixes/{id}/reject` | Human rejects fix |
+
+### Pull Requests (Change #5)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/prs` | Create PR from approved fixes `{scan_id}` |
+| `GET` | `/api/v1/scans/{id}/prs` | PRs for a scan |
+| `GET` | `/api/v1/repos/{id}/prs` | All PRs for a repo |
+| `POST` | `/api/v1/prs/{id}/refresh` | Sync PR status from GitHub |
+
+### Dashboard (Change #5)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/dashboard/summary` | Aggregate: score trend, finding counts by severity, recent scans |
+
+### Reports
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/scans/{id}/report` | Export `?format=pdf\|md` |
+
+### Settings
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/settings` | Get user settings |
+| `PUT` | `/api/v1/settings` | Update settings |
+
+### IDOR Enforcement Pattern (Change #3)
+
+Every endpoint that touches a resource follows this chain:
+
+```python
+async def get_scan_findings(scan_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(404)
+    repo = db.query(Repository).filter(Repository.id == scan.repo_id).first()
+    if repo.user_id != current_user.id:      # ← IDOR check
+        raise HTTPException(403)
+    ...
+```
+
+A `get_owned_scan(scan_id, user)` helper will be shared across all routers.
+
+---
+
+## 6. Agent Workflow (LangGraph)
+
+### 6.1 Graph State Machine (Change #7)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Ingest
+    Ingest --> Scan
+    Scan --> Triage
+    Triage --> PickNextFinding: findings_queue not empty
+    Triage --> Report: no findings to fix
+
+    PickNextFinding --> Fix: finding selected
+    Fix --> Verify: patch generated
+    Verify --> PickNextFinding: pass (finding done)
+    Verify --> Fix: fail AND attempts < 3
+    Verify --> MarkNeedsReview: attempts == 3
+    MarkNeedsReview --> PickNextFinding: next finding
+
+    PickNextFinding --> Report: queue exhausted
+    Report --> [*]
+```
+
+### 6.2 AgentState TypedDict (Changes #7, #8, #19)
+
+```python
+class AgentState(TypedDict):
+    # Identity
+    scan_id: str
+    repo_id: str
+    user_id: str
+
+    # Runtime secrets (ephemeral, never written to agent_logs)
+    github_token: str
+
+    # Workspace (uses WORKSPACE_ROOT, not /tmp)
+    workspace_dir: str            # e.g. {WORKSPACE_ROOT}/scans/{scan_id}
+
+    # Language detection
+    languages: list[str]          # MVP: ["python", "javascript", "typescript"]
+    test_runner: str | None       # "pytest" | "npm_test" | None
+
+    # Findings pipeline
+    raw_findings: list[RawFinding]
+    findings: list[Finding]       # normalized + triaged
+    findings_queue: list[str]     # finding IDs yet to attempt
+    current_finding_id: str | None
+
+    # Fix loop
+    fix_attempts: dict[str, int]  # finding_id → attempt count
+    fix_errors: dict[str, str]    # finding_id → last error (fed back to Fix node)
+    patches: dict[str, Patch]     # finding_id → approved patch
+
+    # Baseline (Change #8)
+    baseline_test_result: TestResult | None
+    baseline_scan_result: list[RawFinding]
+
+    # PR
+    pr_url: str | None
+    branch_name: str | None
+    commit_sha: str | None
+
+    # Telemetry
+    tokens_used: int
+    errors: list[str]
+
+    # Progress (written to agent_logs table, not stored here)
+    # progress is DB-driven; no in-memory bus needed
+```
+
+### 6.3 Node Descriptions
+
+**1. Ingest** (Change #16, #19)
+- Use `WORKSPACE_ROOT` env var (cross-platform, works on Windows with Docker Desktop/WSL2)
+- `git clone --depth=1 --no-local --config core.hooksPath=/dev/null` (disable hooks)
+- `--no-recurse-submodules` to block submodule execution
+- Auth via `Authorization: Bearer <token>` one-off header; **never** write token to `.git/config`
+- Enforce `MAX_REPO_SIZE_MB=100` (fail fast if remote advertises larger pack)
+- Workspace cleanup: `finally` block in scan_task + TTL cleanup job (Change #16)
+- Detect test runner: check for `pytest.ini` / `setup.cfg [tool:pytest]` / `pyproject.toml [pytest]` → `"pytest"`; check for `package.json:scripts.test` → `"npm_test"` (Change #21)
+- Ignore symlinks: `os.walk` with `followlinks=False`; reject any path containing `..`
+
+**2. Scan** (Changes #13, #14)
+- Runs **inside the Docker sandbox image** (no native Semgrep on Windows host)
+- Semgrep uses **bundled rules** (copied into image at build time), `--metrics=off`, `--config /rules`
+- MVP languages: Python (`semgrep --lang python`) and JS/TS (`semgrep --lang js`)
+- Two-stage sandbox:
+  - **Stage A** (install): network enabled, resource-limited, no secrets injected
+  - **Stage B** (scan): `--network=none`, non-root, read-only FS except `/tmp`
+- All scanner output normalized to `Finding` schema via `normalizer.py`
+- Emit per-scanner progress to `agent_logs`
+
+**3. Triage (LLM)** (Changes #11)
+- Uses `LLM_TRIAGE_MODEL` (fast/cheap model, e.g. `gemini-2.0-flash`)
+- **Prompt injection defense** (primary): per-request random nonce `N`
+  ```
+  SYSTEM: ...instructions...
+  <CODE nonce="N">
+  {code_snippet}
+  </CODE nonce="N">
+  ```
+  The nonce is a random UUID generated per request. Code cannot escape the tag because the closing tag includes the nonce the LLM was told to expect. The LLM is instructed to treat everything between the tags as data only.
+- Regex injection signal filter: flag (but do not block alone) patterns like `"ignore previous instructions"` — reported as a warning in agent_logs
+- LLM output: structured JSON validated by Pydantic. Hallucinated fields are stripped, not passed through.
+- Tasks: remove FPs, deduplicate by fingerprint, assign severity, map CWE/OWASP, plain-English explanation, confidence score
+- Findings below `CONFIDENCE_THRESHOLD` → `needs_review`
+
+**4. Fix (LLM)** (Changes #9, #11)
+- Uses `LLM_FIX_MODEL` (stronger model, e.g. `gemini-2.5-pro`)
+- **No unified diff from LLM**. Prompt asks for structured JSON:
+  ```json
+  {
+    "file": "relative/path/to/file.py",
+    "line_start": 42,
+    "line_end": 44,
+    "replacement_code": "safe_code_here",
+    "explanation": "Replaced string interpolation with parameterized query"
+  }
+  ```
+- Pydantic validates: `file` must match finding's `file_path`, `line_start/end` within bounds, `replacement_code` is a non-empty string
+- `patch_builder.py` generates a unified diff using `difflib.unified_diff` (no `patch` binary dependency)
+- `patch_validator.py` enforces guardrails (see §8)
+- If prior attempt failed, error message is appended to prompt: `"Previous attempt failed: {error}. Try a different approach."`
+- Respects `MAX_FINDINGS_TO_FIX` cap (Change #7)
+
+**5. Verify** (Change #8)
+- **Baseline first**: before any patching, run repo tests once to capture `baseline_test_result`. If no test runner detected, skip.
+- Apply patch in-place in workspace directory
+- Re-run Semgrep on the **changed file only** (fast)
+- If test runner present, re-run tests in Docker sandbox Stage B
+- **Pass criteria** (all three must hold):
+  1. Target finding's rule_id no longer fires on patched file
+  2. No **new** findings appear in the changed file vs. baseline scan
+  3. Test results are **no worse** than baseline (same or fewer failures; new failures = reject)
+- On failure: roll back patch (`git checkout -- <file>`), record error, increment attempts
+
+**6. Report** (Change #10)
+- Triggered only when `findings_queue` is empty
+- Re-scan full repo once via sandbox (Change #8)
+- Create branch `secureagent/fix-{scan_id[:8]}` from `default_branch`
+- One commit per approved fix, commit message: `fix({rule_id}): {title} [secureagent]`
+- Open PR **only** if:
+  - `auto_open_pr=true` in user settings, OR
+  - User clicks "Create PR" in the UI (calls `POST /prs`)
+- **Never auto-merge**
+- PR description includes:
+  - Findings summary table (severity, CWE, file)
+  - Per-fix explanation
+  - ⚠️ **Secret rotation warning** if any fix removes a hardcoded secret (Change #10):
+    > "This PR removes a hardcoded secret from the code. **The secret is still present in git history.** You must rotate it immediately."
+- Persist `PullRequest` + `pr_fixes` join records; update `Scan.status = completed`
+
+---
+
+## 7. SSE & Progress System (Change #17)
+
+### Architecture
+
+Progress is **DB-driven**, not in-memory. Every agent node writes events to `agent_logs`:
+
+```python
+# Inside any agent node:
+db.add(AgentLog(
+    scan_id=state["scan_id"],
+    event_id=next_event_id(),     # monotonically increasing int per scan
+    node_name="fix",
+    level="INFO",
+    message="Generating patch for SQL injection in app.py:42",
+    metadata={"finding_id": "...", "attempt": 1}
+))
+db.commit()
+```
+
+The SSE endpoint **tails** `agent_logs` by `event_id > last_seen`:
+
+```python
+@router.get("/scans/{scan_id}/stream")
+async def stream_scan(scan_id: str, request: Request, last_event_id: str = Header(None)):
+    async def event_generator():
+        last_id = int(last_event_id or 0)
+        while True:
+            logs = db.query(AgentLog).filter(
+                AgentLog.scan_id == scan_id,
+                AgentLog.event_id > last_id
+            ).order_by(AgentLog.event_id).all()
+            for log in logs:
+                yield f"id: {log.event_id}\ndata: {log.to_json()}\n\n"
+                last_id = log.event_id
+            if scan_is_terminal(scan_id):
+                break
+            await asyncio.sleep(0.5)
+    return EventSourceResponse(event_generator())
+```
+
+**Replay**: Client reconnects with `Last-Event-ID: 42` → SSE endpoint resumes from `event_id > 42`. Works identically with BackgroundTasks (MVP) and Celery (Phase 6) because the DB is the shared bus.
+
+---
+
+## 8. Patch Guardrails (Change #12)
+
+`patch_validator.py` rejects any LLM-generated fix that violates:
+
+| Check | Rule |
+|---|---|
+| **File scope** | `fix.file` must exactly equal `finding.file_path` |
+| **Path traversal** | Resolved path must be inside `workspace_dir`; no `..` segments; symlinks ignored |
+| **Protected files** | Reject if file matches: `.github/workflows/**`, `Dockerfile*`, `*.lock`, `package.json`, `*.cfg` CI configs |
+| **Lockfiles** | Reject `package-lock.json`, `yarn.lock`, `Pipfile.lock`, `poetry.lock` |
+| **Scripts** | Reject if `package.json:scripts.*` would be modified |
+| **Patch size** | Diff line count ≤ `MAX_PATCH_LINES` (default 200) |
+| **Line bounds** | `line_start` ≥ 1, `line_end` ≤ file line count, `line_start ≤ line_end` |
+
+Any violation is a hard reject — the fix attempt is marked failed and fed back to the Fix node.
+
+---
+
+## 9. Sandbox Architecture (Changes #13, #14, #15)
+
+### Two-Stage Design
+
+```
+Stage A — install (network: bridge, cpu: 1.0, mem: 1g, timeout: 300s)
+  Input:  workspace (read-write bind mount, scoped to scan workspace dir)
+  Action: pip install -r requirements.txt  OR  npm ci
+  Output: workspace with installed deps (committed to a Docker volume)
+  Notes:  No secrets injected. Install scripts are untrusted; run only here.
+
+Stage B — scan+test (network: none, cpu: 0.5, mem: 512m, timeout: 120s)
+  Input:  workspace from Stage A (read-only) + /tmp (writable)
+  Action: semgrep --config /rules --metrics=off  + pytest / npm test
+  Output: JSON results written to /tmp/results/
+  Notes:  Non-root user (uid 1000), no new privileges, seccomp default profile.
+```
+
+### Docker Socket
+
+FastAPI backend (trusted) spawns sandbox containers via the Docker SDK. **The Docker socket is NOT bind-mounted into any sandbox container.** Sandbox containers have no ability to create other containers.
+
+### Scanner Image Build (Change #14)
+
+```dockerfile
+FROM python:3.11-slim AS sandbox
+# Bundle Semgrep rules at build time — never use --config auto in offline stage
+COPY docker/sandbox/rules/ /rules/
+RUN pip install semgrep==1.x.x --no-cache-dir
+RUN useradd -u 1000 -m scanner
+USER scanner
+```
+
+### Clone Hygiene (Change #16)
+
+```python
+env = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "HOME": "/dev/null",          # prevent reading ~/.gitconfig
+    "GIT_TERMINAL_PROMPT": "0",
+}
+cmd = [
+    "git", "clone",
+    "--depth=1",
+    "--no-local",
+    "--config", "core.hooksPath=/dev/null",  # disable hooks
+    "--no-recurse-submodules",
+    f"--config", f"http.extraHeader=Authorization: Bearer {token}",
+    repo_url,
+    workspace_dir,
+]
+# After clone: unset remote URL to purge token from .git/config
+subprocess.run(["git", "remote", "set-url", "origin", ""], cwd=workspace_dir)
+```
+
+Workspace deletion:
+```python
+try:
+    run_scan(state)
+finally:
+    shutil.rmtree(workspace_dir, ignore_errors=True)
+```
+
+TTL cleanup job runs on a schedule and deletes any `{WORKSPACE_ROOT}/scans/{scan_id}` directories older than `SCAN_TIMEOUT_TOTAL`.
+
+---
+
+## 10. Reliability & Concurrency (Change #18)
+
+### Startup Recovery
+
+```python
+# backend/app/startup.py — called at FastAPI lifespan startup
+def mark_stale_scans():
+    stale_statuses = ["cloning", "scanning", "triaging", "fixing", "verifying"]
+    db.query(Scan).filter(Scan.status.in_(stale_statuses)).update(
+        {"status": "failed", "error_message": "Process restarted"}
+    )
+    db.commit()
+```
+
+### Concurrency Guards
+
+- **One active scan per repo**: `POST /scans` checks for existing `pending/running` scan on that repo and returns `409` if found.
+- **MAX_CONCURRENT_SCANS**: semaphore-based gate in `scan_runner.py`; returns `429` when at capacity.
+- **Total scan timeout**: `SCAN_TIMEOUT_TOTAL` (default 1800s); agent task is cancelled and scan marked `failed` if exceeded.
+
+---
+
+## 11. Windows / WSL2 Configuration (Change #19)
+
+- Target path: `D:\MEETmux\secureagent\`
+- `WORKSPACE_ROOT` env var replaces all hard-coded `/tmp` paths
+  - Windows: `D:\MEETmux\secureagent\workspaces\` (passed through to Docker as a WSL2 path)
+  - Linux/CI: `/tmp/secureagent/`
+- `tempfile.mkdtemp(dir=settings.workspace_root)` used everywhere
+- **Semgrep runs inside Docker**, not natively (Change #19). The backend calls `docker run secureagent-sandbox semgrep ...` — Docker Desktop with WSL2 backend handles path translation.
+- `docker-compose.yml` uses Windows-compatible volume paths.
+
+---
+
+## 12. Environment Variables (.env.example)
+
+```ini
+# ── Frontend / NextAuth ──────────────────────────────────────────────────────
+NEXTAUTH_SECRET=change-me-32-chars-min
+NEXTAUTH_URL=http://localhost:3000
+
+# GitHub OAuth
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+
+# BFF → Backend (server-side only, never NEXT_PUBLIC_)
+BACKEND_URL=http://localhost:8000
+BACKEND_SECRET=change-me-backend-32-chars      # shared HS256 signing secret
+
+# ── Backend ──────────────────────────────────────────────────────────────────
+DATABASE_URL=sqlite:///./secureagent.db         # Phase 6: postgresql://...
+REDIS_URL=redis://localhost:6379/0              # Phase 6 only
+BACKEND_SECRET=change-me-backend-32-chars       # same value as above
+ENCRYPTION_KEY=                                 # Fernet key for access_token_encrypted
+
+# ── Workspace ─────────────────────────────────────────────────────────────────
+WORKSPACE_ROOT=D:\MEETmux\secureagent\workspaces    # Windows; use /tmp/secureagent on Linux
+
+# ── LLM ───────────────────────────────────────────────────────────────────────
+LLM_PROVIDER=google
+LLM_TRIAGE_MODEL=gemini-2.0-flash              # fast/cheap for triage
+LLM_FIX_MODEL=gemini-2.5-pro                   # strong for fix generation
+GOOGLE_API_KEY=
+
+# ── Scan Limits ───────────────────────────────────────────────────────────────
+MAX_REPO_SIZE_MB=100
+MAX_FILES_TO_SCAN=1000
+MAX_LLM_TOKENS_PER_SCAN=200000
+MAX_FINDINGS_TO_FIX=10
+MAX_PATCH_LINES=200
+CONFIDENCE_THRESHOLD=0.7
+AUTO_FIX_SEVERITIES=critical,high,medium
+MAX_FIX_ATTEMPTS=3
+
+# ── Concurrency & Timeouts ────────────────────────────────────────────────────
+MAX_CONCURRENT_SCANS=3
+SCAN_TIMEOUT_TOTAL=1800
+
+# ── Scanners (Phase 2+) ───────────────────────────────────────────────────────
+SEMGREP_TIMEOUT=120
+SANDBOX_IMAGE=secureagent-sandbox:latest
+SANDBOX_CPU=0.5
+SANDBOX_MEMORY=512m
+SANDBOX_TIMEOUT=120
+```
+
+---
+
+## 13. MVP Language & Test Runner Support (Change #21)
+
+### Supported Languages (MVP)
+
+| Language | Scanner | Test Runner Detection |
+|---|---|---|
+| Python | Semgrep (python rules) | `pytest.ini`, `setup.cfg [tool:pytest]`, `pyproject.toml [tool.pytest.ini_options]` → `pytest` |
+| JavaScript | Semgrep (javascript rules) | `package.json:scripts.test` exists → `npm test` |
+| TypeScript | Semgrep (typescript rules) | Same as JS |
+
+Phase 2 adds Bandit (Python), Trivy (containers/IaC), Gitleaks (secrets), pip-audit (Python deps), npm audit (JS deps).
+
+---
+
+## 14. Build Phases & Task Checklist
+
+### ✅ Phase 1 — Scaffolding, Database, GitHub Login
+> Goal: monorepo, DB migrations, GitHub OAuth, BFF JWT, protected routes, IDOR helpers
+
+- [ ] 1.1 Create `D:\MEETmux\secureagent\` monorepo structure
+- [ ] 1.2 Frontend: `create-next-app` with TS + Tailwind + shadcn/ui
+- [ ] 1.3 Frontend: NextAuth GitHub OAuth, server-side session, login page
+- [ ] 1.4 Frontend: `lib/bff.ts` — HS256 JWT minting utility (server-side only)
+- [ ] 1.5 Frontend: BFF Route Handler template (mint JWT → proxy to `BACKEND_URL`)
+- [ ] 1.6 Frontend: Landing page (hero, features, CTA)
+- [ ] 1.7 Frontend: Protected dashboard layout with sidebar + topbar
+- [ ] 1.8 Backend: FastAPI app, CORS (strict origin allowlist), health endpoint
+- [ ] 1.9 Backend: pydantic-settings `config.py` with all env vars
+- [ ] 1.10 Backend: SQLAlchemy + Alembic setup (SQLite), all ORM models incl. `user_settings`, `pr_fixes`
+- [ ] 1.11 Backend: Initial Alembic migration
+- [ ] 1.12 Backend: HS256 JWT middleware (`BACKEND_SECRET` validation)
+- [ ] 1.13 Backend: IDOR helper `get_owned_repo`, `get_owned_scan`
+- [ ] 1.14 Backend: Auth router `/auth/validate`, `/auth/me`; upsert user on login
+- [ ] 1.15 Backend: Startup recovery — mark stale scans as failed
+- [ ] 1.16 `.env.example`, `README.md` (Phase 1 section)
+- [ ] 1.17 **Unit tests**: JWT validation, upsert logic, IDOR helpers (pytest)
+- [ ] 1.18 Smoke test: login flow end-to-end
+
+### 🔲 Phase 2 — Scanner Integration, Finding Normalization, Demo Repo
+> Goal: Semgrep runs in Docker sandbox on a cloned repo; findings stored in DB; demo repo ready
+
+- [ ] 2.1 `docker/sandbox/Dockerfile` — hardened sandbox image with bundled Semgrep rules
+- [ ] 2.2 `demo-vulnerable-repo/` — SQLi, XSS, hardcoded secret, outdated dep (Python + JS)
+- [ ] 2.3 Agent: `Finding`, `RawFinding`, `Patch` Pydantic schemas; `AgentState`
+- [ ] 2.4 Agent: `normalizer.py` — scanner output → `Finding`; fingerprint computation
+- [ ] 2.5 Agent: `SemgrepScanner` (base class + Docker-based implementation)
+- [ ] 2.6 Agent: `IngestNode` — clone (hygiene: no hooks, no submodules, no credential persist), language detect, size check, test runner detect, symlink filter
+- [ ] 2.7 Agent: `ScanNode` — two-stage sandbox, run Semgrep, normalize
+- [ ] 2.8 Backend: `scan_task.py` BackgroundTask; `sse_broker.py` tailing `agent_logs`
+- [ ] 2.9 Backend: SSE endpoint with `Last-Event-ID` replay
+- [ ] 2.10 Backend: Repos router (GET, POST with GitHub push-permission check, DELETE)
+- [ ] 2.11 Backend: `GET /github/repos` endpoint
+- [ ] 2.12 Backend: Scans router (POST, GET, cancel stub)
+- [ ] 2.13 Backend: Findings router (list, detail, update status)
+- [ ] 2.14 Frontend: "Connect Repo" modal (GitHub repo picker)
+- [ ] 2.15 Frontend: Repo page + "Start Scan" button + SSE stepper (`useScanStream`)
+- [ ] 2.16 Frontend: Findings table with severity filter
+- [ ] 2.17 **Unit tests**: normalizer, fingerprint, IngestNode, SemgrepScanner, SSE replay
+
+### 🔲 Phase 3 — LangGraph Agent (Triage, Fix, Verify, Retry Loop)
+> Goal: LLM triages; generates structured JSON fixes; verifies in sandbox with baseline; retry loop
+
+- [ ] 3.1 LLM: Gemini client with dual-model support (`LLM_TRIAGE_MODEL`, `LLM_FIX_MODEL`)
+- [ ] 3.2 LLM: Nonce-delimited prompt builder (`sanitizer.py`) + regex injection signal
+- [ ] 3.3 LLM: Triage prompt template; structured JSON output validated by Pydantic
+- [ ] 3.4 LLM: Fix prompt template; structured JSON `{file, line_start, line_end, replacement_code, explanation}`
+- [ ] 3.5 Agent: `patch_builder.py` — JSON → unified diff via `difflib.unified_diff`
+- [ ] 3.6 Agent: `patch_validator.py` — all 7 guardrail checks
+- [ ] 3.7 Agent: `TriageNode` — LLM call, FP removal, CWE/OWASP mapping, confidence scoring
+- [ ] 3.8 Agent: `FixNode` — structured JSON fix, patch build, patch validate
+- [ ] 3.9 Agent: `VerifyNode` — baseline capture, apply patch, re-scan, run tests, 3-criteria check
+- [ ] 3.10 Agent: Retry edge logic (`fix_attempts` counter, error feedback loop, `needs_review` on exhaustion)
+- [ ] 3.11 Agent: `docker_runner.py` two-stage sandbox (Stage A install, Stage B scan/test)
+- [ ] 3.12 Agent: `MAX_FINDINGS_TO_FIX` cap; findings queue loop wired in `graph.py`
+- [ ] 3.13 Backend: Fixes router (list attempts, approve, reject)
+- [ ] 3.14 Frontend: Finding drawer with LLM explanation + CWE/OWASP tags
+- [ ] 3.15 Frontend: Diff viewer (react-diff-viewer) with Approve/Reject buttons
+- [ ] 3.16 **Unit tests**: triage node (mock LLM), fix node (mock LLM), patch_builder, patch_validator, verify criteria
+
+### 🔲 Phase 4 — GitHub PR Creation & Approval Flow
+> Goal: agent opens a real PR from approved fixes; PR status sync; secret rotation warning
+
+- [ ] 4.1 GitHub service: create branch, commit files (one commit per fix), open PR
+- [ ] 4.2 Agent: `ReportNode` — full repo re-scan, then PR creation (auto or on-demand)
+- [ ] 4.3 `pr_fixes` join table wiring in Report node
+- [ ] 4.4 PR description template: findings table + per-fix explanation + secret rotation warning
+- [ ] 4.5 Backend: `POST /prs` (create PR from approved fixes), `POST /prs/{id}/refresh`
+- [ ] 4.6 Backend: `GET /scans/{id}/prs`, `GET /repos/{id}/prs`
+- [ ] 4.7 Frontend: Pull Requests page (status badges, link to GitHub PR)
+- [ ] 4.8 Frontend: "Create PR" button on scan results page; auto-PR setting
+- [ ] 4.9 (Stretch) Upgrade to GitHub App authentication
+- [ ] 4.10 **Unit tests**: ReportNode, PR description builder, secret rotation flag detection
+
+### 🔲 Phase 5 — Frontend Pages & Live Progress Polish
+> Goal: all 8 pages complete; SSE stepper live; loading states; responsive
+
+- [ ] 5.1 Dashboard: security score card, scan history chart (Recharts), recent findings
+- [ ] 5.2 Dashboard: `GET /dashboard/summary` wired up
+- [ ] 5.3 Repo page: full SSE stepper (Cloning → Scanning → Triaging → Fixing → Verifying → PR Created) with streaming log lines
+- [ ] 5.4 Reports page: export PDF/Markdown
+- [ ] 5.5 Settings page: scanners toggle, severity threshold, LLM model select, `auto_open_pr` toggle
+- [ ] 5.6 Loading skeletons, empty states, toast notifications for all pages
+- [ ] 5.7 Responsive layout audit (mobile-friendly sidebar)
+- [ ] 5.8 `POST /scans/{id}/cancel` wired to UI cancel button
+- [ ] 5.9 **Component tests**: Vitest + React Testing Library for ScanProgress, FindingsTable, DiffViewer
+
+### 🔲 Phase 6 — Production Upgrade, Full Scanner Set, Tests, README, Demo
+> Goal: production-grade stack; all scanners; seeded dashboard; complete README
+
+- [ ] 6.1 PostgreSQL: update `DATABASE_URL`, test Alembic migration from SQLite schema
+- [ ] 6.2 Redis + Celery: replace BackgroundTasks in `scan_task.py` with Celery task (single decorator)
+- [ ] 6.3 Celery Flower monitoring UI in docker-compose
+- [ ] 6.4 Additional scanners: Bandit, Trivy, Gitleaks, pip-audit, npm-audit (Phase 2 base class slots in)
+- [ ] 6.5 `docker-compose.yml`: frontend, backend, agent worker, postgres, redis, flower
+- [ ] 6.6 `docker-compose.dev.yml`: hot-reload volumes for frontend + backend
+- [ ] 6.7 Seed script: demo user, 2 repos, 3 scans, 15 findings across severities, 8 fixes, 1 PR
+- [ ] 6.8 Full test suite: pytest (backend + agent), Vitest (frontend)
+- [ ] 6.9 README: prerequisites, setup steps (Windows + WSL2 notes), architecture diagram, demo walkthrough
+- [ ] 6.10 Browser walkthrough artifact with screenshots
+
+---
+
+## 15. Key Design Decisions (TL;DR)
+
+1. **BFF over direct browser→API**: Zero secrets in the browser. The HS256 JWT is short-lived (10 min), minted server-side, and never touches the client. Eliminates entire class of token-theft attacks.
+2. **SSE via DB tail (agent_logs)**: The SSE endpoint is a stateless DB poller. Reconnection + replay via `Last-Event-ID` works out-of-the-box. No in-memory pub/sub bus needed. Celery migration is transparent.
+3. **Structured JSON fix, not LLM diff**: LLM diffs are unreliable (off-by-one lines, wrong context). We ask for `{file, line_start, line_end, replacement_code}`, validate with Pydantic, and generate the diff ourselves with `difflib`. No `patch` binary required (Windows-safe).
+4. **Nonce delimiters as primary injection defense**: A random UUID nonce in the closing delimiter cannot be predicted or replicated by malicious repo content. Regex filter is a secondary signal only.
+5. **Patch validator**: Hard rejects protect CI/CD configs, lockfiles, and package.json scripts. This prevents the LLM from "fixing" a vulnerability by disabling the test that catches it.
+6. **Baseline tests**: Verify passes only if tests are no worse than before the patch. Prevents fixes that delete tests or comment out assertions.
+7. **SQLite → Postgres**: Schema is identical; only `DATABASE_URL` changes.
+8. **BackgroundTasks → Celery**: `scan_task.py` function becomes a Celery task with `@celery_app.task` in Phase 6. Zero rewrite.
+9. **Docker for Semgrep on Windows**: Avoids native installation issues on Windows. All scanner execution is containerized from day one.
+10. **Secret rotation warning**: If a fix removes a hardcoded secret, the PR description explicitly warns the user that the secret persists in git history and must be rotated.
+11. **`MAX_FINDINGS_TO_FIX` cap**: Prevents runaway LLM costs on large repos. Default 10; configurable per-user in `user_settings`.
+12. **IDOR via shared helpers**: `get_owned_repo(id, user)` and `get_owned_scan(id, user)` are called at every endpoint, not left to individual route developers to remember.
+
+---
+
+*Awaiting your approval to begin Phase 1.*
