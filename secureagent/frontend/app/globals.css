@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+:root {
+  --background: 0 0% 3.9%;
+  --foreground: 0 0% 98%;
+  --card: 0 0% 8%;
+  --card-foreground: 0 0% 98%;
+  --popover: 0 0% 8%;
+  --popover-foreground: 0 0% 98%;
+  --primary: 221 83% 53%;
+  --primary-foreground: 0 0% 98%;
+  --secondary: 0 0% 14.9%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 0 0% 14.9%;
+  --muted-foreground: 0 0% 63.9%;
+  --accent: 0 0% 14.9%;
+  --accent-foreground: 0 0% 98%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 0 0% 18%;
+  --input: 0 0% 18%;
+  --ring: 221 83% 53%;
+  --radius: 0.5rem;
+
+  /* SecureAgent brand colors */
+  --sa-critical: 0 84% 55%;
+  --sa-high: 25 95% 53%;
+  --sa-medium: 48 96% 53%;
+  --sa-low: 221 83% 53%;
+  --sa-info: 174 62% 47%;
+  --sa-glow: 221 83% 53%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Severity badge colors */
+.severity-critical { background: hsl(var(--sa-critical) / 0.15); color: hsl(var(--sa-critical)); border-color: hsl(var(--sa-critical) / 0.3); }
+.severity-high     { background: hsl(var(--sa-high) / 0.15);     color: hsl(var(--sa-high));     border-color: hsl(var(--sa-high) / 0.3); }
+.severity-medium   { background: hsl(var(--sa-medium) / 0.15);   color: hsl(var(--sa-medium));   border-color: hsl(var(--sa-medium) / 0.3); }
+.severity-low      { background: hsl(var(--sa-low) / 0.15);      color: hsl(var(--sa-low));      border-color: hsl(var(--sa-low) / 0.3); }
+.severity-info     { background: hsl(var(--sa-info) / 0.15);     color: hsl(var(--sa-info));     border-color: hsl(var(--sa-info) / 0.3); }
+
+/* Glow effects */
+.glow-primary {
+  box-shadow: 0 0 20px hsl(var(--sa-glow) / 0.3), 0 0 40px hsl(var(--sa-glow) / 0.1);
+}
+
+/* Animated gradient background for hero */
+.hero-gradient {
+  background: radial-gradient(ellipse 80% 80% at 50% -20%, hsl(221 83% 53% / 0.3), transparent),
+              radial-gradient(ellipse 60% 60% at 80% 50%, hsl(262 83% 58% / 0.15), transparent),
+              hsl(var(--background));
+}
+
+/* Code block styling */
+.code-block {
+  background: hsl(0 0% 5%);
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 0.85rem;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: hsl(var(--background)); }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }
+
+/* Scan progress stepper */
+.step-active   { color: hsl(var(--primary)); border-color: hsl(var(--primary)); }
+.step-done     { color: hsl(142 71% 45%); border-color: hsl(142 71% 45%); background: hsl(142 71% 45% / 0.15); }
+.step-pending  { color: hsl(var(--muted-foreground)); border-color: hsl(var(--border)); }
+
+/* Subtle card hover */
+.card-hover {
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+}
+.card-hover:hover {
+  border-color: hsl(var(--primary) / 0.5);
+  box-shadow: 0 4px 24px hsl(var(--primary) / 0.1);
+  transform: translateY(-1px);
+}
+
+/* Loading pulse */
+@keyframes shimmer {
+  0% { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, hsl(var(--muted)) 25%, hsl(var(--border)) 50%, hsl(var(--muted)) 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: var(--radius);
+}
+
+/* Hide Next.js development overlay & indicators */
+nextjs-portal,
+[data-nextjs-toast],
+[data-nextjs-dev-tools-button],
+#nextjs-dev-tools-indicator {
+  display: none !important;
+}
