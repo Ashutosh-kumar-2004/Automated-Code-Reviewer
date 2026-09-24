@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Next.js & Build outputs
+.next/
+out/
+*.tsbuildinfo
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables & secrets (keep .env.example)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# Temporary scan workspaces
+workspaces/
+test_workspaces/
+
+# IDE & Editor files
+.vscode/
+.idea/
